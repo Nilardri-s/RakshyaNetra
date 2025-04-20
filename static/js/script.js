@@ -1,4 +1,6 @@
 document.addEventListener('DOMContentLoaded', function () {
+
+
     // Mobile Navigation
     const hamburger = document.querySelector('.hamburger');
     const navLinks = document.querySelector('.nav-links');
@@ -18,20 +20,55 @@ document.addEventListener('DOMContentLoaded', function () {
     const sosButton = document.querySelector('.sos-button');
     if (sosButton) {
         sosButton.addEventListener('click', function () {
-            // Send POST request to Flask backend
-            fetch('/api/trigger-sos', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ message: "EMERGENCY: I need immediate help!" })
-            })
+            // Get emergency contacts from form
+            const contacts = [];
+            document.querySelectorAll('.emergency-contact').forEach(input => {
+                if (input.value.trim()) contacts.push(input.value.trim());
+            });
+
+            // Get user details
+            const userName = document.getElementById('user-name').value || 'Anonymous';
+
+            // Get location
+            if (navigator.geolocation) {
+                navigator.geolocation.getCurrentPosition(position => {
+                    sendAlert({
+                        contacts: contacts,
+                        user_name: userName,
+                        location: `https://maps.google.com/?q=${position.coords.latitude},${position.coords.longitude}`
+                    });
+                }, () => {
+                    sendAlert({
+                        contacts: contacts,
+                        user_name: userName,
+                        location: "Location unavailable"
+                    });
+                });
+            } else {
+                sendAlert({
+                    contacts: contacts,
+                    user_name: userName,
+                    location: "Location service blocked"
+                });
+            }
+        });
+    }
+
+    function sendAlert(data) {
+        fetch('/api/trigger-sos', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+        })
             .then(response => response.json())
             .then(data => {
-                alert(data.message || 'Emergency alert sent to your emergency contacts!');
+                if (data.errors) {
+                    alert(`Partial success: ${data.message}\nErrors: ${data.errors.join(', ')}`);
+                } else {
+                    alert(data.message);
+                }
             })
-            .catch(() => {
-                alert('Failed to send emergency alert.');
-            });
-        });
+            .catch(() => alert('Failed to send alerts'));
     }
 
     // Form validation and backend submission for standalone report page
@@ -61,22 +98,23 @@ document.addEventListener('DOMContentLoaded', function () {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(data)
             })
-            .then(response => response.json())
-            .then(data => {
-                alert(data.message || 'Your report has been submitted successfully!');
-                reportForm.reset();
-            })
-            .catch(() => {
-                alert('Failed to submit report.');
-            });
+                .then(response => response.json())
+                .then(data => {
+                    alert(data.message || 'Your report has been submitted successfully!');
+                    reportForm.reset();
+                })
+                .catch(() => {
+                    alert('Failed to submit report.');
+                });
         });
     }
 });
 
-// Initialize Google Maps
+let map, directionsService, directionsRenderer;
+
 function initMap() {
     const mapElement = document.getElementById('safety-map');
-    const map = new google.maps.Map(mapElement, {
+    map = new google.maps.Map(mapElement, {
         center: { lat: 40.7128, lng: -74.0060 },
         zoom: 13,
         styles: [
@@ -88,27 +126,10 @@ function initMap() {
         ]
     });
 
-    // Fetch heatmap data from backend
-    fetch('/api/heatmap-data')
-        .then(response => response.json())
-        .then(safetyData => {
-            const heatmapData = safetyData.map(item => ({
-                location: new google.maps.LatLng(item.lat, item.lng),
-                weight: item.weight || 1
-            }));
-            const heatmap = new google.maps.visualization.HeatmapLayer({
-                data: heatmapData,
-                map: map,
-                radius: 50,
-                gradient: [
-                    'rgba(0, 255, 0, 0)',
-                    'rgba(0, 255, 0, 1)',
-                    'rgba(255, 255, 0, 1)',
-                    'rgba(255, 0, 0, 1)'
-                ]
-            });
-        });
+    directionsService = new google.maps.DirectionsService();
+    directionsRenderer = new google.maps.DirectionsRenderer({ map: map, suppressMarkers: false });
 
+    // Optionally, show user location
     if (navigator.geolocation) {
         navigator.geolocation.getCurrentPosition(function (position) {
             const userLocation = {
@@ -131,11 +152,58 @@ function initMap() {
             map.setCenter(userLocation);
         });
     }
+}
 
-    map.addListener('click', function (event) {
-        showReportIncidentForm({ lat: event.latLng.lat(), lng: event.latLng.lng() });
+// This function is called when the user clicks "Find Safest Route"
+async function calculateSafeRoute() {
+    const start = document.getElementById('start').value;
+    const end = document.getElementById('end').value;
+
+    if (!start || !end) {
+        alert('Please enter both start and end locations.');
+        return;
+    }
+
+    directionsService.route({
+        origin: start,
+        destination: end,
+        travelMode: 'WALKING',
+        provideRouteAlternatives: true
+    }, async function (response, status) {
+        if (status === 'OK') {
+            // Fetch incident data
+            const incidents = await fetch('/api/incidents').then(res => res.json());
+            // Score each route
+            const scoredRoutes = response.routes.map(route => {
+                let dangerScore = 0;
+                route.overview_path.forEach(point => {
+                    incidents.forEach(incident => {
+                        if (incident.location && isNear(point, incident.location, 0.002)) { // ~200m
+                            dangerScore += incident.severity || 1;
+                        }
+                    });
+                });
+                return { route, dangerScore };
+            });
+            // Find safest route (lowest dangerScore)
+            const safest = scoredRoutes.reduce((a, b) => a.dangerScore < b.dangerScore ? a : b);
+            directionsRenderer.setDirections({ routes: [safest.route] });
+
+            // Optionally, color safest route green and others red
+            // (Advanced: requires custom Polyline drawing, see Google Maps docs)
+        } else {
+            alert('Directions request failed due to ' + status);
+        }
     });
 }
+
+// Helper: check if point is near incident
+function isNear(point, incidentLocation, threshold) {
+    const latDiff = Math.abs(point.lat() - incidentLocation.lat);
+    const lngDiff = Math.abs(point.lng() - incidentLocation.lng);
+    return latDiff < threshold && lngDiff < threshold;
+}
+
 
 // Show modal and submit incident to backend
 function showReportIncidentForm(location) {
@@ -192,14 +260,14 @@ function showReportIncidentForm(location) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(data)
         })
-        .then(response => response.json())
-        .then(data => {
-            alert(data.message || 'Incident reported successfully!');
-            modal.style.display = 'none';
-        })
-        .catch(() => {
-            alert('Failed to report incident.');
-        });
+            .then(response => response.json())
+            .then(data => {
+                alert(data.message || 'Incident reported successfully!');
+                modal.style.display = 'none';
+            })
+            .catch(() => {
+                alert('Failed to report incident.');
+            });
     };
 }
 
